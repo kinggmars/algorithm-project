@@ -2,6 +2,7 @@
 combine_models.py  —— 多阶马尔可夫模型组合
 
 支持 2 种或 3 种不同 k 值的组合，提供多种加权策略。
+分类显著性使用置换检验（permutation test），比固定阈值更可靠。
 
 用法：
     # 指定 2 个 k 值，网格搜索最优权重
@@ -19,10 +20,11 @@ combine_models.py  —— 多阶马尔可夫模型组合
         --test ./proj1/test/test.fa --map ./proj1/test/seq_id.map \\
         --k-list "4 6 8 10 12 15 18"
 
-    # 指定权重策略（不用网格搜索）
+    # 指定权重策略 + 置换检验参数
     python combine_models.py --genomes ./proj1/genomes \\
         --test ./proj1/test/test.fa --map ./proj1/test/seq_id.map \\
-        --k1 6 --k2 15 --strategy accuracy_weighted
+        --k1 6 --k2 15 --strategy accuracy_weighted \\
+        --z-threshold 2.0 --n-permutations 100
 
 权重策略：
     uniform_raw      — 原始对数似然直接平均
@@ -31,9 +33,11 @@ combine_models.py  —— 多阶马尔可夫模型组合
     grid_search      — 网格搜索最优权重组合（默认）
 
 原理：
-    不同 k 值的马尔可夫模型产生的对数似然分数尺度不同（k 越大，累加项越少但每项更确定）。
-    组合前先做"每步归一化"：score / (L - k)，即每条 read 每个转移步骤的平均对数概率。
-    这样不同 k 的模型在相同的尺度上进行比较和加权。
+    不同 k 值的马尔可夫模型产生的对数似然分数尺度不同。
+    组合前先做"每步归一化"：score / (L - k)，使不同 k 在相同尺度上比较。
+    组合后对每条 read 使用置换检验判断匹配显著性：
+      将 read 打乱 n_permutations 次，用组合模型打分，构造零分布；
+      原始得分需超出零分布均值 z_threshold 个标准差才认为显著。
 """
 
 import os
@@ -46,9 +50,10 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils import K_DENSE_THRESHOLD, THRESHOLD_FACTOR, ID2NAME
+from utils import (K_DENSE_THRESHOLD, Z_SCORE_THRESHOLD, N_PERMUTATIONS,
+                   ID2NAME)
 from markov_train import train_all_genomes, save_models, load_models
-from classify_cpu import score_read, classify_all
+from classify_cpu import score_read, shuffle_sequence
 from data_loader import read_fasta, load_seq_id_map, get_genome_files
 
 
@@ -58,7 +63,7 @@ from data_loader import read_fasta, load_seq_id_map, get_genome_files
 
 def get_models(genome_dir: str, k: int, cache_dir: str = "./models"):
     """训练或从缓存加载某个 k 值的全部模型。
-       缓存文件命名：k≤12 → models_dense_k{k}.pkl，k>12 → models_sparse_k{k}.pkl
+       缓存文件命名：k≤11 → models_dense_k{k}.pkl，k>11 → models_sparse_k{k}.pkl
     """
     suffix = "dense" if k <= K_DENSE_THRESHOLD else "sparse"
     cache_path = os.path.join(cache_dir, f"models_{suffix}_k{k}.pkl")
@@ -101,9 +106,70 @@ def compute_score_matrix(reads: list, models: list, k: int, normalize: bool = Tr
     return scores
 
 
-def classify_from_scores(scores: np.ndarray, threshold: float = THRESHOLD_FACTOR):
+def classify_combined_with_permutation(scores: np.ndarray, reads: list,
+                                        models_by_k: dict, ks: list,
+                                        combine_weights: list,
+                                        z_threshold: float, n_permutations: int):
     """
-    从分数矩阵中分类：argmax + 阈值过滤。
+    使用置换检验对组合分数进行分类。
+
+    参数：
+        scores: 组合后的分数矩阵 (n_reads × n_genomes)
+        reads: (read_id, seq) 列表
+        models_by_k: {k: models_list} 各 k 值的模型
+        ks: 参与组合的 k 值列表
+        combine_weights: 各 k 的权重（应与 ks 顺序一致）
+        z_threshold: z 值阈值
+        n_permutations: 打乱次数
+    返回：
+        labels: 分类标签数组，-1 表示不显著
+    """
+    n_reads = len(reads)
+    labels = np.full(n_reads, -1, dtype=int)
+
+    for i in range(n_reads):
+        best_g = int(np.argmax(scores[i]))
+        best_score = scores[i, :][best_g]
+        if best_score == -np.inf:
+            continue
+
+        # 对最佳基因组构造零分布
+        null_scores = np.empty(n_permutations)
+        for p in range(n_permutations):
+            shuffled = shuffle_sequence(reads[i][1])
+            combined_s = 0.0
+            for ki, wk in zip(ks, combine_weights):
+                L = len(shuffled)
+                if L <= ki:
+                    combined_s = -np.inf
+                    break
+                raw = score_read(shuffled, models_by_k[ki][best_g], ki)
+                combined_s += wk * raw / max(1, L - ki)
+            null_scores[p] = combined_s
+
+        if np.all(null_scores == -np.inf):
+            continue
+
+        null_mean = null_scores.mean()
+        null_std = null_scores.std(ddof=1)
+        if null_std == 0:
+            continue
+
+        z = (best_score - null_mean) / null_std
+        if z >= z_threshold:
+            labels[i] = best_g
+
+    return labels
+
+
+# ============================================================
+# 准确率评估（使用简单 argmax，用于网格搜索时快速评估）
+# ============================================================
+
+def classify_from_scores(scores: np.ndarray, threshold: float = -np.inf):
+    """
+    从分数矩阵中快速分类：argmax（不含置换检验）。
+    用于网格搜索阶段的快速评估。
     scores: (n_reads, n_genomes)
     """
     best_idx = np.argmax(scores, axis=1)
@@ -112,17 +178,8 @@ def classify_from_scores(scores: np.ndarray, threshold: float = THRESHOLD_FACTOR
     return best_idx
 
 
-# ============================================================
-# 准确率评估
-# ============================================================
-
 def evaluate_accuracy(labels: np.ndarray, read_ids: list, map_file: str, ref_models: list):
-    """使用 seq_id.map / seq_id_numeric.map 评估分类准确率。
-       自动识别两种格式：
-         - 数值格式: "read_id genome_id"（如 0 NC_015656）
-         - 原始格式: "read_id\\t物种全名"（如 0\\tFrankia symbiont...）
-       ref_models: 任意 k 的模型列表，用于获取 genome_id → index 映射
-    """
+    """使用 seq_id.map / seq_id_numeric.map 评估分类准确率。"""
     true_mapping = {}
     with open(map_file, 'r') as f:
         for line in f:
@@ -175,7 +232,7 @@ def combine_uniform_norm(score_dict: dict, k_list: list):
 
 
 def combine_accuracy_weighted(score_dict: dict, k_list: list, acc_dict: dict):
-    """策略3: 以各模型准确率为权重。"""
+    """策略3: 以各模型单独准确率为权重。"""
     weights = np.array([acc_dict[k] for k in k_list])
     weights = weights / weights.sum()
     result = np.zeros_like(list(score_dict.values())[0])
@@ -245,7 +302,7 @@ def grid_search_3models(score_dict: dict, k1: int, k2: int, k3: int,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="多阶马尔可夫模型组合",
+        description="多阶马尔可夫模型组合（置换检验）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -266,13 +323,17 @@ def main():
     parser.add_argument("--k2", type=int, default=None, help="第二个 k 值")
     parser.add_argument("--k3", type=int, default=None, help="第三个 k 值（可选）")
     parser.add_argument("--k-list", type=str, default=None,
-                        help="空格分隔的 k 值列表，如 \"4 6 8 10 12 15\"。将穷举所有 2-组合和 3-组合。")
+                        help="空格分隔的 k 值列表。将穷举所有 2-组合和 3-组合。")
     parser.add_argument("--strategy", type=str, default="grid_search",
                         choices=["uniform_raw", "uniform_norm", "accuracy_weighted", "grid_search"],
                         help="权重策略 (默认 grid_search)")
     parser.add_argument("--grid-steps", type=int, default=21,
                         help="网格搜索步数 (默认 21，即步长 0.05)")
     parser.add_argument("--cache-dir", default="./models", help="模型缓存目录")
+    parser.add_argument("--z-threshold", type=float, default=Z_SCORE_THRESHOLD,
+                        help=f"置换检验 z 值阈值（默认 {Z_SCORE_THRESHOLD}）")
+    parser.add_argument("--n-permutations", type=int, default=N_PERMUTATIONS,
+                        help=f"随机打乱次数（默认 {N_PERMUTATIONS}）")
     args = parser.parse_args()
 
     # ---- 解析 k 值列表 ----
@@ -291,6 +352,8 @@ def main():
 
     k_values = sorted(set(k_values))
     print(f"[INFO] 参与组合的 k 值: {k_values}")
+    print(f"[INFO] 置换检验: z 阈值={args.z_threshold}, "
+          f"打乱次数={args.n_permutations}")
 
     # ---- 加载数据 ----
     print(f"\n[INFO] 读取测试数据...")
@@ -304,19 +367,19 @@ def main():
     for k in k_values:
         all_models[k] = get_models(args.genomes, k, args.cache_dir)
 
-    # 任意一组模型的 genome_id → index 映射，用于评估
     ref_models = all_models[k_values[0]]
 
     # ---- 计算每步归一化分数矩阵 ----
     print(f"\n[INFO] 计算分数矩阵（每步归一化）...")
-    score_norm = {}  # 每步归一化
-    score_raw = {}   # 原始分数
-    baseline_acc = {}  # 各 k 的基准准确率
+    score_norm = {}
+    score_raw = {}
+    baseline_acc = {}
 
     for k in k_values:
         t0 = time.time()
         score_norm[k] = compute_score_matrix(test_reads, all_models[k], k, normalize=True)
         score_raw[k] = compute_score_matrix(test_reads, all_models[k], k, normalize=False)
+        # 基准准确率使用简单 argmax（网格搜索也用它，保持一致）
         labels = classify_from_scores(score_norm[k])
         acc, correct, total = evaluate_accuracy(labels, read_ids, args.map, all_models[k])
         baseline_acc[k] = acc
@@ -325,7 +388,7 @@ def main():
 
     # ---- 基准结果汇总 ----
     print(f"\n{'='*70}")
-    print(f"单模型基准准确率")
+    print(f"单模型基准准确率（argmax，不含置换检验）")
     print(f"{'='*70}")
     for k in k_values:
         print(f"  k={k:2d}: {baseline_acc[k]:.2f}%")
@@ -338,37 +401,34 @@ def main():
     print(f"模型组合结果")
     print(f"{'='*70}")
 
-    all_combinations = []  # [(desc, acc, detail), ...]
+    all_combinations = []
 
     if len(k_values) == 2 or (args.k1 and args.k2 and not args.k3 and not args.k_list):
-        # 单个 2-组合
         k1, k2 = k_values[0], k_values[1]
         _run_combination(k1, k2, None, score_norm, score_raw, baseline_acc,
-                         read_ids, args.map, ref_models, args.strategy,
-                         args.grid_steps, all_combinations)
+                         read_ids, test_reads, args.map, ref_models, all_models,
+                         args.strategy, args.grid_steps,
+                         args.z_threshold, args.n_permutations, all_combinations)
 
     elif len(k_values) == 3 and not args.k_list:
-        # 单个 3-组合
         k1, k2, k3 = k_values[0], k_values[1], k_values[2]
         _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
-                         read_ids, args.map, ref_models, args.strategy,
-                         args.grid_steps, all_combinations)
+                         read_ids, test_reads, args.map, ref_models, all_models,
+                         args.strategy, args.grid_steps,
+                         args.z_threshold, args.n_permutations, all_combinations)
 
     else:
-        # --k-list 模式：穷举所有 2-组合和 3-组合
         print(f"[INFO] 穷举所有 2-组合和 3-组合...")
-
-        # 2-组合
         for k1, k2 in itertools.combinations(k_values, 2):
             _run_combination(k1, k2, None, score_norm, score_raw, baseline_acc,
-                             read_ids, args.map, ref_models, "grid_search",
-                             args.grid_steps, all_combinations)
-
-        # 3-组合
+                             read_ids, test_reads, args.map, ref_models, all_models,
+                             "grid_search", args.grid_steps,
+                             args.z_threshold, args.n_permutations, all_combinations)
         for k1, k2, k3 in itertools.combinations(k_values, 3):
             _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
-                             read_ids, args.map, ref_models, "grid_search",
-                             args.grid_steps, all_combinations)
+                             read_ids, test_reads, args.map, ref_models, all_models,
+                             "grid_search", args.grid_steps,
+                             args.z_threshold, args.n_permutations, all_combinations)
 
     # ---- 最终汇总 ----
     print(f"\n{'='*70}")
@@ -393,7 +453,8 @@ def main():
 
 
 def _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
-                     read_ids, map_file, ref_models, strategy, grid_steps, results_list):
+                     read_ids, test_reads, map_file, ref_models, all_models,
+                     strategy, grid_steps, z_threshold, n_permutations, results_list):
     """执行一组组合并记录结果。"""
     ks = (k1, k2) if k3 is None else (k1, k2, k3)
     desc = "+".join(f"k{k}" for k in ks)
@@ -402,18 +463,25 @@ def _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
     if strategy == "uniform_raw":
         score_subset = {k: score_raw[k] for k in ks}
         combined = combine_uniform_raw(score_subset, list(ks))
-        labels = classify_from_scores(combined)
+        # 使用置换检验分类
+        weights = [1.0 / len(ks)] * len(ks)
+        labels = classify_combined_with_permutation(
+            combined, test_reads, all_models, list(ks), weights,
+            z_threshold, n_permutations)
         acc, correct, total = evaluate_accuracy(labels, read_ids, map_file, ref_models)
-        detail = f"原始分数等权平均"
+        detail = f"原始分数等权平均 + 置换检验"
         print(f"  {desc}: {acc:.2f}% [{detail}]")
         results_list.append((desc, acc, detail))
 
     elif strategy == "uniform_norm":
         score_subset = {k: score_norm[k] for k in ks}
         combined = combine_uniform_norm(score_subset, list(ks))
-        labels = classify_from_scores(combined)
+        weights = [1.0 / len(ks)] * len(ks)
+        labels = classify_combined_with_permutation(
+            combined, test_reads, all_models, list(ks), weights,
+            z_threshold, n_permutations)
         acc, correct, total = evaluate_accuracy(labels, read_ids, map_file, ref_models)
-        detail = f"归一化等权平均"
+        detail = f"归一化等权平均 + 置换检验"
         print(f"  {desc}: {acc:.2f}% [{detail}]")
         results_list.append((desc, acc, detail))
 
@@ -421,10 +489,12 @@ def _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
         score_subset = {k: score_norm[k] for k in ks}
         acc_subset = {k: baseline_acc[k] for k in ks}
         combined = combine_accuracy_weighted(score_subset, list(ks), acc_subset)
-        labels = classify_from_scores(combined)
+        w = [baseline_acc[k] / sum(baseline_acc[k] for k in ks) for k in ks]
+        labels = classify_combined_with_permutation(
+            combined, test_reads, all_models, list(ks), list(w),
+            z_threshold, n_permutations)
         acc, correct, total = evaluate_accuracy(labels, read_ids, map_file, ref_models)
-        weights = [baseline_acc[k] / sum(baseline_acc[k] for k in ks) for k in ks]
-        detail = f"准确率加权 {[f'{w:.3f}' for w in weights]}"
+        detail = f"准确率加权 {[f'{x:.3f}' for x in w]} + 置换检验"
         print(f"  {desc}: {acc:.2f}% [{detail}]")
         results_list.append((desc, acc, detail))
 
@@ -435,7 +505,15 @@ def _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
                 score_subset, ks[0], ks[1], read_ids, map_file, ref_models,
                 steps=grid_steps)
             detail = f"α={best_alpha:.2f} (k{ks[0]}), 1-α={1-best_alpha:.2f} (k{ks[1]})"
-            print(f"  {desc}: {best_acc:.2f}% [{detail}]")
+            # 用最优权重 + 置换检验重新评估
+            combined = best_alpha * score_subset[ks[0]] + (1 - best_alpha) * score_subset[ks[1]]
+            labels = classify_combined_with_permutation(
+                combined, test_reads, all_models, list(ks),
+                [best_alpha, 1 - best_alpha],
+                z_threshold, n_permutations)
+            perm_acc, _, _ = evaluate_accuracy(labels, read_ids, map_file, ref_models)
+            detail += f", 置换检验准确率={perm_acc:.2f}%"
+            print(f"  {desc}: grid={best_acc:.2f}% [{detail}]")
             results_list.append((desc, best_acc, detail))
         else:
             best_weights, best_acc, grid_results = grid_search_3models(
@@ -443,7 +521,16 @@ def _run_combination(k1, k2, k3, score_norm, score_raw, baseline_acc,
                 steps=grid_steps)
             w = [f"{x:.2f}" for x in best_weights]
             detail = f"权重 k{ks[0]}={w[0]} k{ks[1]}={w[1]} k{ks[2]}={w[2]}"
-            print(f"  {desc}: {best_acc:.2f}% [{detail}]")
+            alpha, beta, gamma = best_weights
+            combined = (alpha * score_subset[ks[0]] + beta * score_subset[ks[1]]
+                        + gamma * score_subset[ks[2]])
+            labels = classify_combined_with_permutation(
+                combined, test_reads, all_models, list(ks),
+                [alpha, beta, gamma],
+                z_threshold, n_permutations)
+            perm_acc, _, _ = evaluate_accuracy(labels, read_ids, map_file, ref_models)
+            detail += f", 置换检验准确率={perm_acc:.2f}%"
+            print(f"  {desc}: grid={best_acc:.2f}% [{detail}]")
             results_list.append((desc, best_acc, detail))
 
 

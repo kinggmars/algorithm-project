@@ -17,6 +17,13 @@ ID2NAME={'NC_009767': 'Roseiflexus castenholzii DSM 13941 chromosome, complete g
 PSEUDOCOUNT = 1
 
 
-K_DENSE_THRESHOLD = 12  # k <= 12 使用稠密矩阵，否则使用稀疏字典
+K_DENSE_THRESHOLD = 11  # k <= 11 使用稠密矩阵，否则使用稀疏字典
 
-THRESHOLD_FACTOR = -5.0  # 分类得分的阈值因子，低于该值则分类为 -1
+# 显著性检验：z 值阈值。原始序列得分需超过随机打乱序列得分均值
+# 至少 Z_SCORE_THRESHOLD 个标准差，才认为匹配显著（单侧检验）。
+# 1.96 对应约 97.5% 置信水平（单侧），可在运行时通过命令行覆盖。
+Z_SCORE_THRESHOLD = 1.645
+
+# 显著性检验：随机打乱次数，用于构建零分布。
+# 值越大检验越稳定，但耗时线性增长。推荐 50~100。
+N_PERMUTATIONS = 50

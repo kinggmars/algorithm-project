@@ -8,22 +8,22 @@ markov_train.py
     save_models(models, filepath)                           # 保存到磁盘
     models = load_models(filepath)                          # 从磁盘加载
 
-    训练结果统一返回模型字典（Dict）
+    训练结果统一返回模型字典（Dict）。
     模型字典中包含 'type' 字段（'dense' 或 'sparse'），下游函数可根据此字段选择查表方式。
 
     1) 伪计数平滑：低 k 与高 k 均使用相同的伪计数策略。
        低 k：初始化矩阵时直接填充 PSEUDOCOUNT，再叠加实际计数。
-       高 k：转移计数用 defaultdict(lambda: np.full(4, pseudocount))，
-              初始计数用 defaultdict(lambda: pseudocount)，并在每次出现时加 1，
-              保证与低 k 数学完全一致。
+       高 k：转移计数用 defaultdict(lambda: np.full(4, pseudocount))。
     2) 初始概率：虽然训练时计算了 init_log_prob / init_log_prob_dict，
        但分类时不再使用（见 classify_cpu.score_read 的注释）。
-       原因是高 k 的初始概率无法覆盖所有可能的 k-mer（稀疏），造成高低 k 尺度不一致。
     3) 高 k 模型额外提供 'default_log_prob'（均匀分布的对数值），
-       用于打分时遇到训练末见的上下文时回退。
+       用于打分时遇到训练未见的上下文时回退。
+    4) 保存/加载使用增量 pickle（逐模型写入/读取），避免高 k 稀疏模型
+       一次性序列化全部模型导致 MemoryError。
 """
 
 import os
+import gc
 import pickle
 import numpy as np
 from typing import Dict, List
@@ -69,7 +69,7 @@ def _train_low(seq: str, k: int, pseudocount: float) -> Dict:
 # 高 k 训练（稀疏字典）
 def _train_high(seq: str, k: int, pseudocount: float) -> Dict:
     trans_count = defaultdict(lambda: np.full(4, pseudocount, dtype=np.float64))
-    init_count = defaultdict(lambda: pseudocount)            # 修改 2
+    init_count = defaultdict(lambda: pseudocount)
 
     clean_seq = ''.join([b if b in BASE2ID else 'N' for b in seq])
     contigs = clean_seq.split('N')
@@ -84,7 +84,7 @@ def _train_high(seq: str, k: int, pseudocount: float) -> Dict:
             ctx = 0
             for j in range(k):
                 ctx = ctx * 4 + seq_int[i + j]
-            init_count[ctx] += 1                              # 修改 3
+            init_count[ctx] += 1
 
         for i in range(L - k):
             ctx = 0
@@ -93,11 +93,15 @@ def _train_high(seq: str, k: int, pseudocount: float) -> Dict:
             next_base = seq_int[i + k]
             trans_count[ctx][next_base] += 1
 
+    # 构建对数概率字典，同时释放中间计数结构以降低内存峰值
     log_prob_dict = {}
     for ctx, counts in trans_count.items():
         log_prob_dict[ctx] = np.log(counts / counts.sum())
+    del trans_count  # 释放 defaultdict，降低后续操作的内存压力
+
     total_init = sum(init_count.values())
     init_log_prob_dict = {ctx: np.log(cnt / total_init) for ctx, cnt in init_count.items()}
+    del init_count
 
     return {
         'k': k,
@@ -134,13 +138,45 @@ def train_all_genomes(genome_dir: str, k: int, pseudocount: float = PSEUDOCOUNT)
 
 
 def save_models(models: List[Dict], filepath: str) -> None:
-    """将模型列表保存到磁盘（pickle 格式）。"""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, 'wb') as f:
-        pickle.dump(models, f)
+    """
+    将模型列表保存到磁盘。
+    使用增量写入（逐模型 pickle），避免一次性序列化全部模型导致 MemoryError。
+    格式兼容：旧格式为直接 pickle 列表，新格式为首条为 {'n': N, 'v': 1} 的 header。
+    load_models 自动识别两种格式。
+    """
+    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+
+    tmp_path = filepath + '.tmp'
+    with open(tmp_path, 'wb') as f:
+        # 写入 header，标记为新格式
+        pickle.dump({'n': len(models), 'v': 1}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for i, model in enumerate(models):
+            pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+            # 每 3 个模型触发一次 gc，帮助回收序列化产生的临时内存
+            if i % 3 == 0:
+                gc.collect()
+
+    # 原子替换
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    os.rename(tmp_path, filepath)
 
 
 def load_models(filepath: str) -> List[Dict]:
-    """从磁盘加载模型列表。"""
+    """
+    从磁盘加载模型列表。自动识别新旧两种格式：
+      - 新格式：首条为 {'n': N, 'v': 1}，后续 N 条为模型字典
+      - 旧格式：首条为 list（直接 pickle 的模型列表）
+    """
     with open(filepath, 'rb') as f:
-        return pickle.load(f)
+        first = pickle.load(f)
+        if isinstance(first, dict) and 'n' in first:
+            n = first['n']
+            models = []
+            for _ in range(n):
+                models.append(pickle.load(f))
+            return models
+        elif isinstance(first, list):
+            return first
+        else:
+            raise ValueError(f"无法识别的模型文件格式: {filepath}")
